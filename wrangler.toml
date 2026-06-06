@@ -1,0 +1,9 @@
+name = "mycfo-mcp"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+[vars]
+# Set these as secrets in Cloudflare dashboard, not here!
+# wrangler secret put SUPABASE_URL
+# wrangler secret put SUPABASE_KEY
+# wrangler secret put MCP_SECRET

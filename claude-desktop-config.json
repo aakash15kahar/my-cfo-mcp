@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "my-cfo": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://mycfo-mcp.YOUR-SUBDOMAIN.workers.dev/mcp"],
+      "env": {
+        "MCP_REMOTE_AUTH_HEADER": "Authorization: Bearer YOUR_MCP_SECRET"
+      }
+    }
+  }
+}
