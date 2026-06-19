@@ -231,12 +231,71 @@ async function handleOAuth(request, env, url, corsHeaders) {
     }), { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 
-  // Authorization endpoint — single user, auto-approve, issue a signed code
+  // Authorization endpoint — shows a real login form; requires the MCP_SECRET before issuing a code
   if (url.pathname === '/authorize' && request.method === 'GET') {
-    const redirectUri = url.searchParams.get('redirect_uri');
+    const redirectUri = url.searchParams.get('redirect_uri') || '';
     const state = url.searchParams.get('state') || '';
+    const clientId = url.searchParams.get('client_id') || '';
+    const page = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>Authorize My CFO</title>
+      <style>
+        body{background:#10141b;color:#e9e6dd;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:16px}
+        .card{background:#161b25;border:1px solid #2a3242;border-radius:14px;padding:32px;max-width:380px;width:100%;text-align:center}
+        h1{font-size:20px;margin:0 0 8px}
+        p{color:#9aa3b8;font-size:13px;margin:0 0 20px;line-height:1.5}
+        input{width:100%;background:#1c2330;border:1px solid #2a3242;border-radius:8px;padding:11px 12px;color:#e9e6dd;font-size:14px;margin-bottom:12px;box-sizing:border-box}
+        button{width:100%;background:#c9a227;color:#10141b;border:none;border-radius:8px;padding:11px;font-size:14px;font-weight:600;cursor:pointer}
+        .err{color:#c1604b;font-size:13px;margin-bottom:12px}
+      </style></head><body>
+      <div class="card">
+        <h1>🔐 Authorize access</h1>
+        <p>An app is requesting access to your My CFO financial data. Enter your MCP secret key to allow this.</p>
+        <form method="POST" action="/authorize">
+          <input type="hidden" name="redirect_uri" value="${redirectUri}">
+          <input type="hidden" name="state" value="${state}">
+          <input type="hidden" name="client_id" value="${clientId}">
+          <input type="password" name="secret" placeholder="Your MCP secret key" required autofocus>
+          <button type="submit">Authorize</button>
+        </form>
+      </div></body></html>`;
+    return new Response(page, { headers: { ...corsHeaders, 'Content-Type': 'text/html' } });
+  }
+
+  // Authorization submit — validates the secret before issuing a code
+  if (url.pathname === '/authorize' && request.method === 'POST') {
+    const text = await request.text();
+    const params = Object.fromEntries(new URLSearchParams(text));
+    const redirectUri = params.redirect_uri;
+    const state = params.state || '';
     if (!redirectUri) return new Response('Missing redirect_uri', { status: 400, headers: corsHeaders });
-    // The "code" simply carries our real secret, base64-encoded — only whoever already has access to this URL can get this far
+
+    if (params.secret !== env.MCP_SECRET) {
+      const errorPage = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Authorize My CFO</title>
+        <style>
+          body{background:#10141b;color:#e9e6dd;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:16px}
+          .card{background:#161b25;border:1px solid #2a3242;border-radius:14px;padding:32px;max-width:380px;width:100%;text-align:center}
+          h1{font-size:20px;margin:0 0 8px}
+          p{color:#9aa3b8;font-size:13px;margin:0 0 20px;line-height:1.5}
+          input{width:100%;background:#1c2330;border:1px solid #2a3242;border-radius:8px;padding:11px 12px;color:#e9e6dd;font-size:14px;margin-bottom:12px;box-sizing:border-box}
+          button{width:100%;background:#c9a227;color:#10141b;border:none;border-radius:8px;padding:11px;font-size:14px;font-weight:600;cursor:pointer}
+          .err{color:#c1604b;font-size:13px;margin-bottom:12px}
+        </style></head><body>
+        <div class="card">
+          <h1>🔐 Authorize access</h1>
+          <p class="err">Incorrect secret key. Please try again.</p>
+          <form method="POST" action="/authorize">
+            <input type="hidden" name="redirect_uri" value="${redirectUri}">
+            <input type="hidden" name="state" value="${state}">
+            <input type="hidden" name="client_id" value="${params.client_id||''}">
+            <input type="password" name="secret" placeholder="Your MCP secret key" required autofocus>
+            <button type="submit">Authorize</button>
+          </form>
+        </div></body></html>`;
+      return new Response(errorPage, { status: 401, headers: { ...corsHeaders, 'Content-Type': 'text/html' } });
+    }
+
+    // Secret correct — issue a real code
     const code = b64url(env.MCP_SECRET + '::' + Date.now());
     const redirect = new URL(redirectUri);
     redirect.searchParams.set('code', code);
