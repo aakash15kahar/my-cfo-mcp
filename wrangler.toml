@@ -1,4 +1,4 @@
-name = "my-cfo-mcp-git"
+name = "my-cfo-mcp"
 main = "worker.js"
 compatibility_date = "2024-11-01"
 
