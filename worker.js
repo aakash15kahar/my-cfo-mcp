@@ -1,5 +1,6 @@
 /**
- * My CFO — MCP Server (v2 with OAuth support for Claude Connectors)
+ * My CFO — MCP Server (v1.1.0)
+ * Adds: Resources (cfo://database/schema) + Prompts (weekly-budget-review)
  * Hosted on Cloudflare Workers
  *
  * Env vars needed (already set):
@@ -11,14 +12,15 @@ const TOOLS = [
     inputSchema: { type: "object", properties: { month: { type: "string", description: "Optional. Month in YYYY-MM format. Defaults to current month." } } } },
   { name: "get_transactions", description: "Get transactions. Can filter by category, date range, or search by description.",
     inputSchema: { type: "object", properties: {
-      category: { type: "string", enum: ["income", "expense", "investment"] },
+      category: { type: "string", enum: ["income", "expense", "investment", "transfer"] },
       month: { type: "string" }, limit: { type: "number" }, search: { type: "string" }
     } } },
-  { name: "add_transaction", description: "Add a new financial transaction. Use this when the user says things like 'I spent £X on Y' or 'I got paid £X' or 'I invested £X'.",
+  { name: "add_transaction", description: "Add a new financial transaction. Use this when the user says things like 'I spent £X on Y' or 'I got paid £X' or 'I invested £X'. Use category 'transfer' for credit card bill payments — never log those as 'expense', since that double-counts spending already logged when the purchases were made.",
     inputSchema: { type: "object", required: ["description", "amount", "category", "date"], properties: {
       description: { type: "string" }, amount: { type: "number" },
-      category: { type: "string", enum: ["income", "expense", "investment"] },
-      subcat: { type: "string", enum: ["salary","freelance","other-income","housing","food","transport","bills","health","entertainment","shopping","dining","other-expense","stocks","pension","crypto","property","other-inv"] },
+      category: { type: "string", enum: ["income", "expense", "investment", "transfer"] },
+      subcat: { type: "string", enum: ["salary","freelance","other-income","rent","council-tax","electric","wifi","groceries","petrol","housing","food","transport","bills","health","entertainment","shopping","dining","other-expense","stocks","pension","crypto","property","other-inv","credit-card-payment","account-transfer","other-transfer"] },
+      payment_method: { type: "string", enum: ["cash","debit","credit","bank-transfer"], description: "How the transaction was paid for" },
       date: { type: "string" }, note: { type: "string" }
     } } },
   { name: "delete_transaction", description: "Delete a transaction by its ID. First use get_transactions to find the ID.",
@@ -45,8 +47,95 @@ const TOOLS = [
     inputSchema: { type: "object", required: ["id"], properties: { id: { type: "number" } } } },
   { name: "get_profile", description: "Get the user's financial profile — monthly income, budget, savings target and currency.", inputSchema: { type: "object", properties: {} } },
   { name: "update_profile", description: "Update the user's financial profile settings.",
-    inputSchema: { type: "object", properties: { income: { type: "number" }, budget: { type: "number" }, save_target: { type: "number" }, currency: { type: "string" } } } }
+    inputSchema: { type: "object", properties: { income: { type: "number" }, budget: { type: "number" }, save_target: { type: "number" }, currency: { type: "string" } } } },
+  { name: "get_budgets", description: "Get all budget envelopes with how much has been spent against each this month and how much remains. Use this before evaluating whether the user is on track against their budgets.",
+    inputSchema: { type: "object", properties: {} } }
 ];
+
+// ─── RESOURCES (app-controlled ground-truth context) ──────────
+const RESOURCES = [
+  {
+    uri: "cfo://database/schema",
+    name: "Database Schema",
+    description: "Ground-truth structural layout of the My CFO Supabase tables, so an AI agent never guesses or hallucinates column names.",
+    mimeType: "text/plain"
+  }
+];
+
+function getSchemaResourceText() {
+  return `MY CFO — SUPABASE DATABASE SCHEMA (ground truth — use these exact column names)
+
+TABLE: cfo_transactions
+  id               bigint, primary key, auto-increment
+  description      text — what the transaction is for
+  amount           numeric — always stored positive; sign is implied by category
+  category         text — one of: 'income' | 'expense' | 'investment' | 'transfer'
+                   ('transfer' is for things like credit card bill payments —
+                    it is excluded from spending totals to avoid double-counting
+                    purchases that were already logged individually as 'expense')
+  subcat           text — sub-category, e.g. 'groceries', 'rent', 'credit-card-payment'
+  payment_method   text, nullable — one of: 'cash' | 'debit' | 'credit' | 'bank-transfer'
+  date             date — when the transaction occurred
+  note             text, nullable
+  created_at       timestamptz
+
+TABLE: cfo_budgets  (envelope budgeting)
+  id               bigint, primary key, auto-increment
+  name             text — display name of the envelope, e.g. "Rent"
+  subcat           text — must match a cfo_transactions.subcat value to link spending
+  monthly_amount   numeric — the budgeted ceiling for this envelope, per month
+  created_at       timestamptz
+  NOTE: there is no 'category' or 'limit_amount' column on this table — the correct
+  names are 'subcat' and 'monthly_amount'. An envelope's "spent this month" is
+  calculated by summing cfo_transactions WHERE category='expense' AND
+  subcat = cfo_budgets.subcat, for the current calendar month.
+
+TABLE: cfo_goals
+  id, name, target_amount, current_amount, target_date, created_at
+
+TABLE: cfo_investments
+  id, name, balance, type, monthly_contribution, created_at
+
+TABLE: cfo_profile  (single row, id always = 1)
+  id, income, save_target, budget, currency, created_at, updated_at`;
+}
+
+// ─── PROMPTS (user-controlled reusable workflows) ──────────────
+const PROMPTS = [
+  {
+    name: "weekly-budget-review",
+    description: "Acts as a forensic accountant: reviews the last 7 days of spending against your allowance cap and budget envelopes, then returns exactly two specific optimization rules.",
+    arguments: [
+      { name: "allowance_cap", description: "Your discretionary/optional spending ceiling for the week, in pounds (e.g. '50')", required: true }
+    ]
+  }
+];
+
+function buildWeeklyBudgetReviewPrompt(cap) {
+  return `You are acting as a meticulous forensic household accountant performing a Weekly Budget Review. Follow this exact process:
+
+1. DATA GATHERING — call these tools yourself, in this order, before writing any analysis:
+   a. get_transactions (look at the last 7 days)
+   b. get_budgets (every envelope's monthly limit, spent-so-far, and remaining)
+   c. get_summary (overall health score, savings rate, cash flow for the month)
+
+2. ALLOWANCE CAP CHECK — the user's discretionary spending ceiling for this week is £${cap}.
+   Sum all "optional" spending this week (entertainment, shopping, dining sub-categories)
+   and state clearly whether they are under, at, or over this cap, and by how much.
+
+3. ENVELOPE EVALUATION — for each budget envelope report: spent this month, remaining,
+   and flag any envelope that is "over budget" or "nearly depleted" (under 15% remaining
+   with more than a week left in the month).
+
+4. OUTPUT FORMAT — return your findings with these exact sections, in this order:
+   - Weekly allowance check (one-sentence verdict + the numbers)
+   - Envelope status (short table or bullet list: envelope -> spent / remaining / status)
+   - Exactly two household optimization rules — no more, no fewer. Each must be specific
+     and actionable, grounded in the real numbers you gathered, not generic advice.
+
+Do not skip step 1. Do not guess any numbers — every figure in your output must come from
+a tool call you actually made in this conversation.`;
+}
 
 function sbHeaders(env) {
   return { 'Content-Type': 'application/json', 'apikey': env.SUPABASE_KEY, 'Authorization': `Bearer ${env.SUPABASE_KEY}`, 'Prefer': 'return=representation' };
@@ -84,7 +173,8 @@ function calcStats(transactions) {
   transactions.forEach(t => {
     if (t.category === 'income') income += Number(t.amount);
     else if (t.category === 'investment') invested += Number(t.amount);
-    else spent += Number(t.amount);
+    else if (t.category === 'expense') spent += Number(t.amount);
+    // 'transfer' is intentionally excluded — not new spending
   });
   const cashflow = income - spent - invested;
   const saverate = income > 0 ? Math.round((cashflow / income) * 100) : 0;
@@ -138,10 +228,11 @@ async function executeTool(name, args, env) {
     }
     case 'add_transaction': {
       const tx = { description: args.description, amount: Math.abs(args.amount), category: args.category,
-        subcat: args.subcat || (args.category === 'income' ? 'other-income' : args.category === 'investment' ? 'other-inv' : 'other-expense'),
+        subcat: args.subcat || (args.category === 'income' ? 'other-income' : args.category === 'investment' ? 'other-inv' : args.category === 'transfer' ? 'other-transfer' : 'other-expense'),
+        payment_method: args.payment_method || null,
         date: args.date || today, note: args.note || '' };
       const rows = await sbInsert(env, 'cfo_transactions', tx);
-      return { success: true, message: `✓ Added: ${tx.description} (${tx.category === 'income' ? '+' : '-'}£${tx.amount}) on ${tx.date}`, transaction: rows[0] };
+      return { success: true, message: `✓ Added: ${tx.description} (${tx.category === 'income' ? '+' : tx.category === 'transfer' ? '↔' : '-'}£${tx.amount}) on ${tx.date}`, transaction: rows[0] };
     }
     case 'delete_transaction': { await sbDelete(env, 'cfo_transactions', args.id); return { success: true, message: `✓ Deleted transaction ID ${args.id}` }; }
     case 'get_goals': {
@@ -172,6 +263,20 @@ async function executeTool(name, args, env) {
       await sbUpsert(env, 'cfo_profile', updated);
       return { success: true, message: '✓ Profile updated', profile: updated };
     }
+    case 'get_budgets': {
+      const budgets = await sbGet(env, 'cfo_budgets', 'order=created_at.asc');
+      const txs = await sbGet(env, 'cfo_transactions', `category=eq.expense&order=date.desc`);
+      const [yr, mo] = currentMonth.split('-').map(Number);
+      const monthTxs = txs.filter(t => { const d = new Date(t.date); return d.getFullYear() === yr && d.getMonth() + 1 === mo; });
+      const enriched = budgets.map(b => {
+        const spent = monthTxs.filter(t => t.subcat === b.subcat).reduce((s, t) => s + Number(t.amount), 0);
+        const remaining = Number(b.monthly_amount) - spent;
+        const pctUsed = Number(b.monthly_amount) > 0 ? (spent / Number(b.monthly_amount)) * 100 : 0;
+        const status = remaining < 0 ? 'over budget' : pctUsed >= 85 ? 'nearly depleted' : 'on track';
+        return { ...b, spent_this_month: `£${spent.toFixed(2)}`, remaining: `£${remaining.toFixed(2)}`, status };
+      });
+      return { count: enriched.length, budgets: enriched };
+    }
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
@@ -183,7 +288,7 @@ async function handleMCP(request, env) {
   const error = (code, message) => new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }), { headers: { 'Content-Type': 'application/json' } });
 
   if (method === 'initialize') {
-    return respond({ protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'my-cfo-mcp', version: '1.0.0' } });
+    return respond({ protocolVersion: '2024-11-05', capabilities: { tools: {}, resources: {}, prompts: {} }, serverInfo: { name: 'my-cfo-mcp', version: '1.1.0' } });
   }
   if (method === 'tools/list') return respond({ tools: TOOLS });
   if (method === 'tools/call') {
@@ -192,6 +297,31 @@ async function handleMCP(request, env) {
       const result = await executeTool(name, args || {}, env);
       return respond({ content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     } catch (e) { return error(-32603, e.message); }
+  }
+  if (method === 'resources/list') {
+    return respond({ resources: RESOURCES });
+  }
+  if (method === 'resources/read') {
+    const uri = params?.uri;
+    const resource = RESOURCES.find(r => r.uri === uri);
+    if (!resource) return error(-32602, `Unknown resource URI: ${uri}`);
+    return respond({ contents: [{ uri: resource.uri, mimeType: resource.mimeType, text: getSchemaResourceText() }] });
+  }
+  if (method === 'prompts/list') {
+    return respond({ prompts: PROMPTS });
+  }
+  if (method === 'prompts/get') {
+    const name = params?.name;
+    const promptArgs = params?.arguments || {};
+    if (name === 'weekly-budget-review') {
+      const cap = promptArgs.allowance_cap;
+      if (!cap) return error(-32602, 'Missing required argument: allowance_cap');
+      return respond({
+        description: 'Forensic weekly budget review against your allowance cap and envelopes',
+        messages: [{ role: 'user', content: { type: 'text', text: buildWeeklyBudgetReviewPrompt(cap) } }]
+      });
+    }
+    return error(-32602, `Unknown prompt: ${name}`);
   }
   if (method === 'notifications/initialized') return new Response(null, { status: 202 });
   return error(-32601, `Method not found: ${method}`);
@@ -202,7 +332,6 @@ function b64url(str) { return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').
 function fromB64url(str) { return atob(str.replace(/-/g, '+').replace(/_/g, '/')); }
 
 async function handleOAuth(request, env, url, corsHeaders) {
-  // Discovery metadata
   if (url.pathname === '/.well-known/oauth-authorization-server' || url.pathname === '/.well-known/openid-configuration') {
     const origin = url.origin;
     return new Response(JSON.stringify({
@@ -217,7 +346,6 @@ async function handleOAuth(request, env, url, corsHeaders) {
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 
-  // Dynamic client registration — accept any client, issue a client_id
   if (url.pathname === '/register' && request.method === 'POST') {
     const body = await request.json().catch(() => ({}));
     const clientId = 'mycfo-' + crypto.randomUUID();
@@ -261,7 +389,6 @@ async function handleOAuth(request, env, url, corsHeaders) {
     return new Response(page, { headers: { ...corsHeaders, 'Content-Type': 'text/html' } });
   }
 
-  // Authorization submit — validates the secret before issuing a code
   if (url.pathname === '/authorize' && request.method === 'POST') {
     const text = await request.text();
     const params = Object.fromEntries(new URLSearchParams(text));
@@ -295,7 +422,6 @@ async function handleOAuth(request, env, url, corsHeaders) {
       return new Response(errorPage, { status: 401, headers: { ...corsHeaders, 'Content-Type': 'text/html' } });
     }
 
-    // Secret correct — issue a real code
     const code = b64url(env.MCP_SECRET + '::' + Date.now());
     const redirect = new URL(redirectUri);
     redirect.searchParams.set('code', code);
@@ -303,7 +429,6 @@ async function handleOAuth(request, env, url, corsHeaders) {
     return new Response(null, { status: 302, headers: { ...corsHeaders, Location: redirect.toString() } });
   }
 
-  // Token endpoint — exchange code for access token
   if (url.pathname === '/token' && request.method === 'POST') {
     let params = {};
     const ct = request.headers.get('content-type') || '';
@@ -321,7 +446,7 @@ async function handleOAuth(request, env, url, corsHeaders) {
     return new Response(JSON.stringify({ error: 'unsupported_grant_type' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 
-  return null; // not an OAuth route
+  return null;
 }
 
 export default {
@@ -335,14 +460,12 @@ export default {
 
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
-    // OAuth endpoints — no Bearer auth required (these ARE the auth flow)
     const oauthRoutes = ['/.well-known/oauth-authorization-server', '/.well-known/openid-configuration', '/register', '/authorize', '/token'];
     if (oauthRoutes.includes(url.pathname)) {
       const oauthResponse = await handleOAuth(request, env, url, corsHeaders);
       if (oauthResponse) return oauthResponse;
     }
 
-    // Auth check for everything else
     const authHeader = request.headers.get('Authorization') || '';
     const apiKey = request.headers.get('x-api-key') || '';
     const token = authHeader.replace('Bearer ', '') || apiKey;
@@ -354,7 +477,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return new Response(JSON.stringify({ status: 'ok', name: 'My CFO MCP Server', version: '1.0.0', tools: TOOLS.length, endpoints: { mcp: '/mcp', tools: '/tools' } }),
+      return new Response(JSON.stringify({ status: 'ok', name: 'My CFO MCP Server', version: '1.1.0', tools: TOOLS.length, resources: RESOURCES.length, prompts: PROMPTS.length, endpoints: { mcp: '/mcp', tools: '/tools' } }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
