@@ -316,9 +316,11 @@ async function handleMCP(request, env) {
     if (name === 'weekly-budget-review') {
       const cap = promptArgs.allowance_cap;
       if (!cap) return error(-32602, 'Missing required argument: allowance_cap');
+      const numCap = parseFloat(cap);
+      if (isNaN(numCap)) return error(-32602, `allowance_cap must be a plain number (e.g. "50"), got: "${cap}"`);
       return respond({
         description: 'Forensic weekly budget review against your allowance cap and envelopes',
-        messages: [{ role: 'user', content: { type: 'text', text: buildWeeklyBudgetReviewPrompt(cap) } }]
+        messages: [{ role: 'user', content: { type: 'text', text: buildWeeklyBudgetReviewPrompt(numCap) } }]
       });
     }
     return error(-32602, `Unknown prompt: ${name}`);
