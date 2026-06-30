@@ -49,16 +49,25 @@ const TOOLS = [
   { name: "update_profile", description: "Update the user's financial profile settings.",
     inputSchema: { type: "object", properties: { income: { type: "number" }, budget: { type: "number" }, save_target: { type: "number" }, currency: { type: "string" } } } },
   { name: "get_budgets", description: "Get all budget envelopes with how much has been spent against each this month and how much remains. Use this before evaluating whether the user is on track against their budgets.",
-    inputSchema: { type: "object", properties: {} } }
+    inputSchema: { type: "object", properties: {} } },
+  { name: "get_spending_chart", description: "Render an interactive doughnut chart of this month's spending by category, inside the conversation. Use this whenever the user asks to see, visualize, or chart their spending — prefer this over describing the breakdown in plain text.",
+    inputSchema: { type: "object", properties: { month: { type: "string", description: "Optional. Month in YYYY-MM format. Defaults to current month." } } },
+    _meta: { ui: { resourceUri: "ui://widgets/cfo-chart" } } }
 ];
 
-// ─── RESOURCES (app-controlled ground-truth context) ──────────
+// ─── RESOURCES (app-controlled ground-truth context + UI widgets) ──
 const RESOURCES = [
   {
     uri: "cfo://database/schema",
     name: "Database Schema",
     description: "Ground-truth structural layout of the My CFO Supabase tables, so an AI agent never guesses or hallucinates column names.",
     mimeType: "text/plain"
+  },
+  {
+    uri: "ui://widgets/cfo-chart",
+    name: "Spending Chart Widget",
+    description: "Interactive Chart.js doughnut chart for visualizing spending by category. Rendered in a sandboxed iframe by MCP Apps-compatible hosts.",
+    mimeType: "text/html;profile=mcp-app"
   }
 ];
 
@@ -135,6 +144,87 @@ function buildWeeklyBudgetReviewPrompt(cap) {
 
 Do not skip step 1. Do not guess any numbers — every figure in your output must come from
 a tool call you actually made in this conversation.`;
+}
+
+// ─── UI WIDGET (MCP Apps — interactive doughnut chart) ────────
+function getSpendingChartWidgetHtml() {
+  // NOTE: deliberately avoids backticks inside the embedded <script> below
+  // (string concatenation instead) so it nests cleanly inside this outer
+  // JS template literal without escaping headaches.
+  return '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+  '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
+  '<style>' +
+  'html,body{margin:0;padding:0;background:#10141b;color:#e9e6dd;font-family:-apple-system,"IBM Plex Sans",sans-serif;min-height:100vh}' +
+  '.wrap{padding:18px 20px;box-sizing:border-box}' +
+  '.hdr{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:14px}' +
+  '.hdr h1{font-family:Georgia,serif;font-size:16px;font-weight:600;margin:0;color:#e9e6dd}' +
+  '.hdr .total{font-family:"Courier New",monospace;font-size:18px;font-weight:600;color:#c9a227}' +
+  '.chartbox{position:relative;height:220px;margin-bottom:14px}' +
+  '.legend{display:flex;flex-direction:column;gap:7px}' +
+  '.row{display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:4px 0;border-bottom:1px solid #222838}' +
+  '.row:last-child{border-bottom:none}' +
+  '.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}' +
+  '.lbl{text-transform:capitalize;color:#cfd3dc}' +
+  '.amt{font-family:"Courier New",monospace;color:#9aa3b8}' +
+  '.empty{color:#5c6478;font-style:italic;text-align:center;padding:30px 0;font-size:13px}' +
+  '.waiting{color:#8a6f1f;font-size:11px;text-align:center;padding:6px 0}' +
+  '</style></head><body>' +
+  '<div class="wrap">' +
+    '<div class="hdr"><h1 id="cfo-month">Spending by category</h1><span class="total" id="cfo-total">—</span></div>' +
+    '<div class="chartbox"><canvas id="cfo-canvas"></canvas></div>' +
+    '<div class="legend" id="cfo-legend"></div>' +
+    '<div class="waiting" id="cfo-waiting">Waiting for data…</div>' +
+  '</div>' +
+  '<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></' + 'script>' +
+  '<script type="module">' +
+  'var PALETTE = ["#c9a227","#74a98a","#c1604b","#8a93a8","#5c6478","#e3c459","#4f7a64","#8f4636"];' +
+  'var chartInstance = null;' +
+  'function renderFromStructured(data) {' +
+    'if (!data || !data.categories) return;' +
+    'document.getElementById("cfo-waiting").style.display = "none";' +
+    'document.getElementById("cfo-month").textContent = "Spending — " + (data.month || "this month");' +
+    'document.getElementById("cfo-total").textContent = "£" + (data.total != null ? data.total.toLocaleString() : "0");' +
+    'var cats = data.categories || [];' +
+    'var legendEl = document.getElementById("cfo-legend");' +
+    'if (!cats.length) {' +
+      'legendEl.innerHTML = "";' +
+      'document.getElementById("cfo-canvas").style.display = "none";' +
+      'var emptyDiv = document.createElement("div");' +
+      'emptyDiv.className = "empty"; emptyDiv.textContent = "No expenses logged yet";' +
+      'legendEl.appendChild(emptyDiv);' +
+      'return;' +
+    '}' +
+    'document.getElementById("cfo-canvas").style.display = "block";' +
+    'legendEl.innerHTML = cats.map(function(c, i) {' +
+      'var color = PALETTE[i % PALETTE.length];' +
+      'return "<div class=\\"row\\"><span class=\\"lbl\\"><span class=\\"dot\\" style=\\"background:" + color + "\\"></span>" + c.label + "</span><span class=\\"amt\\">£" + c.amount + " · " + c.percent + "%</span></div>";' +
+    '}).join("");' +
+    'var ctx = document.getElementById("cfo-canvas").getContext("2d");' +
+    'var chartData = { labels: cats.map(function(c){return c.label;}), datasets: [{ data: cats.map(function(c){return c.amount;}), backgroundColor: cats.map(function(c,i){return PALETTE[i % PALETTE.length];}), borderColor: "#10141b", borderWidth: 2 }] };' +
+    'if (chartInstance) { chartInstance.data = chartData; chartInstance.update(); }' +
+    'else { chartInstance = new Chart(ctx, { type: "doughnut", data: chartData, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } } }); }' +
+  '}' +
+  '(async function(){' +
+    'var App;' +
+    'try {' +
+      'var mod = await import("https://esm.sh/@modelcontextprotocol/ext-apps");' +
+      'App = mod.App;' +
+    '} catch (e) { console.warn("MCP Apps SDK failed to load, using fallback listener", e); }' +
+    'if (App) {' +
+      'var app = new App();' +
+      'app.ontoolresult = function(result) { renderFromStructured(result && result.structuredContent); };' +
+      'try { await app.connect(); } catch (e) { console.warn("app.connect() failed", e); }' +
+    '} else {' +
+      'window.addEventListener("message", function(event) {' +
+        'var d = event.data;' +
+        'if (d && d.structuredContent) renderFromStructured(d.structuredContent);' +
+        'else if (d && d.payload) renderFromStructured(d.payload);' +
+      '});' +
+    '}' +
+    'if (window.__INITIAL_DATA__) renderFromStructured(window.__INITIAL_DATA__);' +
+  '})();' +
+  '</' + 'script>' +
+  '</body></html>';
 }
 
 function sbHeaders(env) {
@@ -277,6 +367,31 @@ async function executeTool(name, args, env) {
       });
       return { count: enriched.length, budgets: enriched };
     }
+    case 'get_spending_chart': {
+      const month = args.month || currentMonth;
+      const [yr, mo] = month.split('-').map(Number);
+      const txs = await sbGet(env, 'cfo_transactions', `category=eq.expense&order=date.desc`);
+      const monthTxs = txs.filter(t => { const d = new Date(t.date); return d.getFullYear() === yr && d.getMonth() + 1 === mo; });
+      const byCat = {};
+      monthTxs.forEach(t => { const k = t.subcat || 'other-expense'; byCat[k] = (byCat[k] || 0) + Number(t.amount); });
+      const total = Object.values(byCat).reduce((s, v) => s + v, 0);
+      const categories = Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([label, amount]) => ({
+        label: label.replace(/-/g, ' '),
+        amount: Math.round(amount * 100) / 100,
+        percent: total > 0 ? Math.round((amount / total) * 100) : 0
+      }));
+      const summaryText = categories.length
+        ? `Spending breakdown for ${month}: total £${total.toFixed(2)} across ${categories.length} categories — ` +
+          categories.map(c => `${c.label}: £${c.amount} (${c.percent}%)`).join(', ') + '.'
+        : `No expenses logged for ${month} yet.`;
+      // Pre-shaped {content, structuredContent} — the generic tools/call handler
+      // detects this shape and passes it through unmodified so the structuredContent
+      // reaches the UI widget via the ui/notifications/tool-result lifecycle step.
+      return {
+        content: [{ type: 'text', text: summaryText }],
+        structuredContent: { month, total: Math.round(total * 100) / 100, categories }
+      };
+    }
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
@@ -288,14 +403,20 @@ async function handleMCP(request, env) {
   const error = (code, message) => new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }), { headers: { 'Content-Type': 'application/json' } });
 
   if (method === 'initialize') {
-    return respond({ protocolVersion: '2024-11-05', capabilities: { tools: {}, resources: {}, prompts: {} }, serverInfo: { name: 'my-cfo-mcp', version: '1.1.0' } });
+    return respond({ protocolVersion: '2024-11-05', capabilities: { tools: {}, resources: {}, prompts: {} }, serverInfo: { name: 'my-cfo-mcp', version: '1.2.0' } });
   }
   if (method === 'tools/list') return respond({ tools: TOOLS });
   if (method === 'tools/call') {
     const { name, arguments: args } = params;
     try {
       const result = await executeTool(name, args || {}, env);
-      return respond({ content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
+      // Tools built for MCP Apps UI (like get_spending_chart) return a pre-shaped
+      // { content, structuredContent } object — pass it through as-is so the
+      // structuredContent reaches the widget. All other tools return plain data
+      // objects, which we keep wrapping as JSON text for backward compatibility.
+      const isPreShaped = result && typeof result === 'object' && Array.isArray(result.content);
+      const payload = isPreShaped ? result : { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      return respond(payload);
     } catch (e) { return error(-32603, e.message); }
   }
   if (method === 'resources/list') {
@@ -305,7 +426,13 @@ async function handleMCP(request, env) {
     const uri = params?.uri;
     const resource = RESOURCES.find(r => r.uri === uri);
     if (!resource) return error(-32602, `Unknown resource URI: ${uri}`);
-    return respond({ contents: [{ uri: resource.uri, mimeType: resource.mimeType, text: getSchemaResourceText() }] });
+    if (uri === 'cfo://database/schema') {
+      return respond({ contents: [{ uri, mimeType: resource.mimeType, text: getSchemaResourceText() }] });
+    }
+    if (uri === 'ui://widgets/cfo-chart') {
+      return respond({ contents: [{ uri, mimeType: resource.mimeType, text: getSpendingChartWidgetHtml() }] });
+    }
+    return error(-32602, `No content handler registered for resource: ${uri}`);
   }
   if (method === 'prompts/list') {
     return respond({ prompts: PROMPTS });
@@ -479,7 +606,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return new Response(JSON.stringify({ status: 'ok', name: 'My CFO MCP Server', version: '1.1.0', tools: TOOLS.length, resources: RESOURCES.length, prompts: PROMPTS.length, endpoints: { mcp: '/mcp', tools: '/tools' } }),
+      return new Response(JSON.stringify({ status: 'ok', name: 'My CFO MCP Server', version: '1.2.0', tools: TOOLS.length, resources: RESOURCES.length, prompts: PROMPTS.length, endpoints: { mcp: '/mcp', tools: '/tools' } }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
