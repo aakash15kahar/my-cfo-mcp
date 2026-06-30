@@ -243,23 +243,44 @@ function getSpendingChartWidgetHtml() {
   // the View (this iframe) to send "ui/initialize" first, then the Host
   // replies and pushes "ui/notifications/tool-result" with the data.
   // This is a best-effort implementation written from public spec docs,
-  // not the official SDK — kept deliberately defensive with fallback
-  // listeners below in case the exact message shape differs.
-  'try {' +
-    'window.parent.postMessage({ jsonrpc: "2.0", id: "cfo-init-1", method: "ui/initialize", params: {} }, "*");' +
-  '} catch (e) {}' +
+  // not the official SDK. A single immediate postMessage risks a race —
+  // if the host hasn't attached its listener yet, that one message is
+  // lost forever (postMessage doesn't queue for late listeners) — so
+  // this retries periodically instead of sending just once, and also
+  // polls for window.__INITIAL_DATA__ in case the host injects data
+  // directly rather than via postMessage.
+  'var dataReceived = false;' +
+  'var attempts = 0;' +
+  'var MAX_ATTEMPTS = 30;' + // ~9 seconds at 300ms intervals
+  'function sendInitPing() {' +
+    'try { window.parent.postMessage({ jsonrpc: "2.0", id: "cfo-init-1", method: "ui/initialize", params: {} }, "*"); } catch (e) {}' +
+  '}' +
+  'var pollTimer = setInterval(function() {' +
+    'attempts++;' +
+    'if (dataReceived || attempts > MAX_ATTEMPTS) {' +
+      'clearInterval(pollTimer);' +
+      'if (!dataReceived) {' +
+        'var w = document.getElementById("cfo-waiting");' +
+        'if (w) w.textContent = "Chart data did not arrive automatically — ask in the chat to describe the breakdown in text instead.";' +
+      '}' +
+      'return;' +
+    '}' +
+    'if (window.__INITIAL_DATA__) { renderFromStructured(window.__INITIAL_DATA__); dataReceived = true; return; }' +
+    'sendInitPing();' +
+  '}, 300);' +
+  'sendInitPing();' + // also try immediately, in addition to the retry loop
 
   'window.addEventListener("message", function(event) {' +
     'var d = event.data;' +
     'if (!d) return;' +
     'try {' +
       // Direct structuredContent shape (defensive fallback #1)
-      'if (d.structuredContent) { renderFromStructured(d.structuredContent); return; }' +
-      'if (d.payload) { renderFromStructured(d.payload); return; }' +
+      'if (d.structuredContent) { renderFromStructured(d.structuredContent); dataReceived = true; return; }' +
+      'if (d.payload) { renderFromStructured(d.payload); dataReceived = true; return; }' +
       // Official lifecycle notification shape (best-effort guess)
       'if (d.method === "ui/notifications/tool-result" && d.params) {' +
-        'renderFromStructured(d.params.structuredContent || d.params.result && d.params.result.structuredContent);' +
-        'return;' +
+        'renderFromStructured(d.params.structuredContent || (d.params.result && d.params.result.structuredContent));' +
+        'dataReceived = true; return;' +
       '}' +
       // Response to our ui/initialize — acknowledge per the spec
       'if (d.id === "cfo-init-1") {' +
