@@ -148,84 +148,133 @@ a tool call you actually made in this conversation.`;
 
 // ─── UI WIDGET (MCP Apps — interactive doughnut chart) ────────
 function getSpendingChartWidgetHtml() {
-  // NOTE: deliberately avoids backticks inside the embedded <script> below
-  // (string concatenation instead) so it nests cleanly inside this outer
-  // JS template literal without escaping headaches.
+  // v2 — fully self-contained, zero external network requests.
+  // The previous version loaded Chart.js + the MCP Apps SDK from CDNs,
+  // which most likely got blocked by the sandboxed iframe's CSP, causing
+  // a totally blank widget. This version hand-draws the doughnut with SVG
+  // (same stroke-dasharray technique used for the app's own health gauge)
+  // and hand-implements the minimal postMessage handshake instead of
+  // depending on an external SDK import.
   return '<!DOCTYPE html><html><head><meta charset="utf-8">' +
   '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
   '<style>' +
-  'html,body{margin:0;padding:0;background:#10141b;color:#e9e6dd;font-family:-apple-system,"IBM Plex Sans",sans-serif;min-height:100vh}' +
+  'html,body{margin:0;padding:0;background:#10141b;color:#e9e6dd;font-family:-apple-system,sans-serif;min-height:100vh}' +
   '.wrap{padding:18px 20px;box-sizing:border-box}' +
   '.hdr{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:14px}' +
   '.hdr h1{font-family:Georgia,serif;font-size:16px;font-weight:600;margin:0;color:#e9e6dd}' +
   '.hdr .total{font-family:"Courier New",monospace;font-size:18px;font-weight:600;color:#c9a227}' +
-  '.chartbox{position:relative;height:220px;margin-bottom:14px}' +
+  '.chartbox{display:flex;justify-content:center;margin-bottom:16px}' +
   '.legend{display:flex;flex-direction:column;gap:7px}' +
   '.row{display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:4px 0;border-bottom:1px solid #222838}' +
   '.row:last-child{border-bottom:none}' +
-  '.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}' +
+  '.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;flex-shrink:0}' +
   '.lbl{text-transform:capitalize;color:#cfd3dc}' +
-  '.amt{font-family:"Courier New",monospace;color:#9aa3b8}' +
+  '.amt{font-family:"Courier New",monospace;color:#9aa3b8;white-space:nowrap}' +
   '.empty{color:#5c6478;font-style:italic;text-align:center;padding:30px 0;font-size:13px}' +
   '.waiting{color:#8a6f1f;font-size:11px;text-align:center;padding:6px 0}' +
+  '.center-label{font-family:"Courier New",monospace;font-size:13px;fill:#9aa3b8;text-anchor:middle}' +
   '</style></head><body>' +
   '<div class="wrap">' +
     '<div class="hdr"><h1 id="cfo-month">Spending by category</h1><span class="total" id="cfo-total">—</span></div>' +
-    '<div class="chartbox"><canvas id="cfo-canvas"></canvas></div>' +
+    '<div class="chartbox">' +
+      '<svg id="cfo-svg" width="180" height="180" viewBox="0 0 180 180"></svg>' +
+    '</div>' +
     '<div class="legend" id="cfo-legend"></div>' +
     '<div class="waiting" id="cfo-waiting">Waiting for data…</div>' +
   '</div>' +
-  '<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></' + 'script>' +
-  '<script type="module">' +
+  '<script>' +
+  '(function(){' +
   'var PALETTE = ["#c9a227","#74a98a","#c1604b","#8a93a8","#5c6478","#e3c459","#4f7a64","#8f4636"];' +
-  'var chartInstance = null;' +
+  'var R = 70, CX = 90, CY = 90, STROKE = 22;' +
+  'var CIRC = 2 * Math.PI * R;' +
+
   'function renderFromStructured(data) {' +
     'if (!data || !data.categories) return;' +
-    'document.getElementById("cfo-waiting").style.display = "none";' +
+    'var waitEl = document.getElementById("cfo-waiting"); if (waitEl) waitEl.style.display = "none";' +
     'document.getElementById("cfo-month").textContent = "Spending — " + (data.month || "this month");' +
     'document.getElementById("cfo-total").textContent = "£" + (data.total != null ? data.total.toLocaleString() : "0");' +
     'var cats = data.categories || [];' +
     'var legendEl = document.getElementById("cfo-legend");' +
+    'var svgEl = document.getElementById("cfo-svg");' +
     'if (!cats.length) {' +
       'legendEl.innerHTML = "";' +
-      'document.getElementById("cfo-canvas").style.display = "none";' +
+      'svgEl.innerHTML = "";' +
       'var emptyDiv = document.createElement("div");' +
       'emptyDiv.className = "empty"; emptyDiv.textContent = "No expenses logged yet";' +
       'legendEl.appendChild(emptyDiv);' +
       'return;' +
     '}' +
-    'document.getElementById("cfo-canvas").style.display = "block";' +
+
+    'var ns = "http://www.w3.org/2000/svg";' +
+    'svgEl.innerHTML = "";' +
+    'var bg = document.createElementNS(ns, "circle");' +
+    'bg.setAttribute("cx", CX); bg.setAttribute("cy", CY); bg.setAttribute("r", R);' +
+    'bg.setAttribute("fill", "none"); bg.setAttribute("stroke", "#222838"); bg.setAttribute("stroke-width", STROKE);' +
+    'svgEl.appendChild(bg);' +
+
+    'var offset = 0;' +
+    'cats.forEach(function(c, i) {' +
+      'var segLen = CIRC * (Math.max(0, Math.min(100, c.percent)) / 100);' +
+      'var circle = document.createElementNS(ns, "circle");' +
+      'circle.setAttribute("cx", CX); circle.setAttribute("cy", CY); circle.setAttribute("r", R);' +
+      'circle.setAttribute("fill", "none");' +
+      'circle.setAttribute("stroke", PALETTE[i % PALETTE.length]);' +
+      'circle.setAttribute("stroke-width", STROKE);' +
+      'circle.setAttribute("stroke-dasharray", segLen + " " + (CIRC - segLen));' +
+      'circle.setAttribute("stroke-dashoffset", -offset);' +
+      'circle.setAttribute("transform", "rotate(-90 " + CX + " " + CY + ")");' +
+      'svgEl.appendChild(circle);' +
+      'offset += segLen;' +
+    '});' +
+
+    'var centerText = document.createElementNS(ns, "text");' +
+    'centerText.setAttribute("x", CX); centerText.setAttribute("y", CY + 5);' +
+    'centerText.setAttribute("class", "center-label");' +
+    'centerText.textContent = cats.length + " cat" + (cats.length === 1 ? "" : "s");' +
+    'svgEl.appendChild(centerText);' +
+
     'legendEl.innerHTML = cats.map(function(c, i) {' +
       'var color = PALETTE[i % PALETTE.length];' +
       'return "<div class=\\"row\\"><span class=\\"lbl\\"><span class=\\"dot\\" style=\\"background:" + color + "\\"></span>" + c.label + "</span><span class=\\"amt\\">£" + c.amount + " · " + c.percent + "%</span></div>";' +
     '}).join("");' +
-    'var ctx = document.getElementById("cfo-canvas").getContext("2d");' +
-    'var chartData = { labels: cats.map(function(c){return c.label;}), datasets: [{ data: cats.map(function(c){return c.amount;}), backgroundColor: cats.map(function(c,i){return PALETTE[i % PALETTE.length];}), borderColor: "#10141b", borderWidth: 2 }] };' +
-    'if (chartInstance) { chartInstance.data = chartData; chartInstance.update(); }' +
-    'else { chartInstance = new Chart(ctx, { type: "doughnut", data: chartData, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } } }); }' +
   '}' +
-  '(async function(){' +
-    'var App;' +
+
+  // Minimal hand-rolled MCP Apps handshake. The official lifecycle expects
+  // the View (this iframe) to send "ui/initialize" first, then the Host
+  // replies and pushes "ui/notifications/tool-result" with the data.
+  // This is a best-effort implementation written from public spec docs,
+  // not the official SDK — kept deliberately defensive with fallback
+  // listeners below in case the exact message shape differs.
+  'try {' +
+    'window.parent.postMessage({ jsonrpc: "2.0", id: "cfo-init-1", method: "ui/initialize", params: {} }, "*");' +
+  '} catch (e) {}' +
+
+  'window.addEventListener("message", function(event) {' +
+    'var d = event.data;' +
+    'if (!d) return;' +
     'try {' +
-      'var mod = await import("https://esm.sh/@modelcontextprotocol/ext-apps");' +
-      'App = mod.App;' +
-    '} catch (e) { console.warn("MCP Apps SDK failed to load, using fallback listener", e); }' +
-    'if (App) {' +
-      'var app = new App();' +
-      'app.ontoolresult = function(result) { renderFromStructured(result && result.structuredContent); };' +
-      'try { await app.connect(); } catch (e) { console.warn("app.connect() failed", e); }' +
-    '} else {' +
-      'window.addEventListener("message", function(event) {' +
-        'var d = event.data;' +
-        'if (d && d.structuredContent) renderFromStructured(d.structuredContent);' +
-        'else if (d && d.payload) renderFromStructured(d.payload);' +
-      '});' +
-    '}' +
-    'if (window.__INITIAL_DATA__) renderFromStructured(window.__INITIAL_DATA__);' +
+      // Direct structuredContent shape (defensive fallback #1)
+      'if (d.structuredContent) { renderFromStructured(d.structuredContent); return; }' +
+      'if (d.payload) { renderFromStructured(d.payload); return; }' +
+      // Official lifecycle notification shape (best-effort guess)
+      'if (d.method === "ui/notifications/tool-result" && d.params) {' +
+        'renderFromStructured(d.params.structuredContent || d.params.result && d.params.result.structuredContent);' +
+        'return;' +
+      '}' +
+      // Response to our ui/initialize — acknowledge per the spec
+      'if (d.id === "cfo-init-1") {' +
+        'window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");' +
+      '}' +
+    '} catch (e) { console.warn("widget message handling error", e); }' +
+  '});' +
+
+  // If the host (or a local test harness) injects data synchronously
+  'if (window.__INITIAL_DATA__) renderFromStructured(window.__INITIAL_DATA__);' +
   '})();' +
   '</' + 'script>' +
   '</body></html>';
 }
+
 
 function sbHeaders(env) {
   return { 'Content-Type': 'application/json', 'apikey': env.SUPABASE_KEY, 'Authorization': `Bearer ${env.SUPABASE_KEY}`, 'Prefer': 'return=representation' };
